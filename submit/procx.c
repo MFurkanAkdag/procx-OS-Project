@@ -25,8 +25,9 @@
 /* Config */
 #define SHM_NAME            "/procx_shm"
 #define SEM_NAME            "/procx_sem"
-#define MQ_NAME             "/procx_mq"
+#define MQ_NAME_PREFIX      "/procx_mq_"
 #define MAX_PROCESSES       50
+#define MAX_INSTANCES       10
 #define MAX_CMD_LEN         256
 #define MAX_ARGS            64
 #define MQ_MAX_MESSAGES     10
@@ -65,6 +66,8 @@ typedef struct {
     ProcessInfo processes[MAX_PROCESSES];
     int process_count;
     int instance_count;
+    pid_t active_instances[MAX_INSTANCES];
+    int active_instance_count;
 } SharedData;
 
 typedef struct {
@@ -73,9 +76,6 @@ typedef struct {
     pid_t sender_pid;
     pid_t target_pid;
 } IPCMessage;
-
-#define MODE_TO_STRING(mode) ((mode) == MODE_DETACHED ? "Detached" : "Attached")
-#define STATUS_TO_STRING(status) ((status) == STATUS_RUNNING ? "Running" : "Terminated")
 
 /* Forward declarations */
 static void monitor_scan_once(pid_t my_pid);
@@ -91,7 +91,8 @@ static int proc_is_alive(pid_t pid);
 /* Globals */
 SharedData *g_shared_data = NULL;
 sem_t *g_semaphore = NULL;
-mqd_t g_msg_queue = (mqd_t)-1;
+mqd_t g_my_msg_queue = (mqd_t)-1;
+char g_my_mq_name[64];
 static int g_shm_fd = -1;
 volatile sig_atomic_t g_running = 1;
 static pthread_t g_monitor_thread;
@@ -156,6 +157,7 @@ static int init_shared_memory(void) {
         memset(g_shared_data, 0, sizeof(SharedData));
         g_shared_data->process_count = 0;
         g_shared_data->instance_count = 1;
+        g_shared_data->active_instance_count = 0;
     } else {
         g_shared_data->instance_count++;
     }
@@ -178,10 +180,13 @@ static int init_message_queue(void) {
     struct mq_attr attr;
     memset(&attr, 0, sizeof(attr));
     attr.mq_maxmsg = MQ_MAX_MESSAGES;
-    attr.mq_msgsize = sizeof(IPCMessage);
+    attr.mq_msgsize = MQ_MSG_SIZE;
 
-    g_msg_queue = mq_open(MQ_NAME, O_CREAT | O_RDWR, IPC_PERMISSIONS, &attr);
-    if (g_msg_queue == (mqd_t)-1) {
+    pid_t my_pid = getpid();
+    snprintf(g_my_mq_name, sizeof(g_my_mq_name), "%s%d", MQ_NAME_PREFIX, my_pid);
+
+    g_my_msg_queue = mq_open(g_my_mq_name, O_CREAT | O_EXCL | O_RDWR, IPC_PERMISSIONS, &attr);
+    if (g_my_msg_queue == (mqd_t)-1) {
         perror("mq_open");
         return -1;
     }
@@ -209,17 +214,45 @@ int ipc_init_all(void) {
         g_semaphore = NULL;
         return -1;
     }
-    printf("[IPC] Message Queue initialized: %s\n", MQ_NAME);
+    printf("[IPC] Message Queue initialized: %s\n", g_my_mq_name);
+
+    /* Register this instance in the active instances list */
+    pid_t my_pid = getpid();
+    ipc_lock();
+    if (g_shared_data->active_instance_count < MAX_INSTANCES) {
+        g_shared_data->active_instances[g_shared_data->active_instance_count] = my_pid;
+        g_shared_data->active_instance_count++;
+        printf("[IPC] Instance registered: PID %d (%d/%d instances)\n",
+               my_pid, g_shared_data->active_instance_count, MAX_INSTANCES);
+    } else {
+        printf("[WARNING] Maximum instances reached, IPC notifications may not work properly\n");
+    }
+    ipc_unlock();
+
     printf("[IPC] All IPC resources ready.\n");
     return 0;
 }
 
 void ipc_cleanup_all(int unlink_resources) {
     int unlink_ipc = 0;
+    pid_t my_pid = getpid();
 
     printf("[IPC] Cleaning up IPC resources...\n");
     if (g_shared_data != NULL && g_semaphore != NULL) {
         ipc_lock();
+        /* Remove this instance from the active instances list */
+        for (int i = 0; i < g_shared_data->active_instance_count; i++) {
+            if (g_shared_data->active_instances[i] == my_pid) {
+                /* Shift remaining instances */
+                for (int j = i; j < g_shared_data->active_instance_count - 1; j++) {
+                    g_shared_data->active_instances[j] = g_shared_data->active_instances[j + 1];
+                }
+                g_shared_data->active_instance_count--;
+                printf("[IPC] Instance unregistered: PID %d\n", my_pid);
+                break;
+            }
+        }
+
         if (g_shared_data->instance_count > 0) {
             g_shared_data->instance_count--;
         }
@@ -239,9 +272,13 @@ void ipc_cleanup_all(int unlink_resources) {
         close(g_shm_fd);
         g_shm_fd = -1;
     }
-    if (g_msg_queue != (mqd_t)-1) {
-        mq_close(g_msg_queue);
-        g_msg_queue = (mqd_t)-1;
+    if (g_my_msg_queue != (mqd_t)-1) {
+        mq_close(g_my_msg_queue);
+        g_my_msg_queue = (mqd_t)-1;
+    }
+    /* Always unlink our own message queue */
+    if (g_my_mq_name[0] != '\0') {
+        mq_unlink(g_my_mq_name);
     }
     if (g_semaphore != NULL) {
         sem_close(g_semaphore);
@@ -250,7 +287,6 @@ void ipc_cleanup_all(int unlink_resources) {
     if (unlink_ipc) {
         shm_unlink(SHM_NAME);
         sem_unlink(SEM_NAME);
-        mq_unlink(MQ_NAME);
         printf("[IPC] IPC resources unlinked.\n");
     }
     printf("[IPC] Cleanup complete.\n");
@@ -330,15 +366,8 @@ void shm_remove_process(int index) {
     }
 }
 
-int shm_get_process_count(void) {
-    if (g_shared_data == NULL) {
-        return 0;
-    }
-    return g_shared_data->process_count;
-}
-
 int mq_send_notification(IPCCommand cmd, pid_t target_pid) {
-    if (g_msg_queue == (mqd_t)-1) {
+    if (g_shared_data == NULL) {
         return -1;
     }
 
@@ -348,41 +377,39 @@ int mq_send_notification(IPCCommand cmd, pid_t target_pid) {
     msg.sender_pid = getpid();
     msg.target_pid = target_pid;
 
-    if (mq_send(g_msg_queue, (const char *)&msg, sizeof(IPCMessage), 0) == -1) {
-        if (errno != EAGAIN) {
-            perror("mq_send");
-        }
-        return -1;
-    }
-    return 0;
-}
+    pid_t my_pid = getpid();
+    int sent_count = 0;
 
-int mq_receive_message(IPCMessage *msg) {
-    if (g_msg_queue == (mqd_t)-1 || msg == NULL) {
-        return -1;
-    }
-    ssize_t bytes = mq_receive(g_msg_queue, (char *)msg, sizeof(IPCMessage), NULL);
-    if (bytes == -1) {
-        if (errno == EAGAIN) {
-            return 0;
-        }
-        return -1;
-    }
-    return 1;
-}
+    /* Broadcast to all active instances except ourselves */
+    ipc_lock();
+    for (int i = 0; i < g_shared_data->active_instance_count; i++) {
+        pid_t instance_pid = g_shared_data->active_instances[i];
 
-int mq_receive_message_blocking(IPCMessage *msg) {
-    if (g_msg_queue == (mqd_t)-1 || msg == NULL) {
-        return -1;
-    }
-    ssize_t bytes = mq_receive(g_msg_queue, (char *)msg, sizeof(IPCMessage), NULL);
-    if (bytes == -1) {
-        if (errno == EINTR) {
-            return 0;
+        /* Skip sending to ourselves */
+        if (instance_pid == my_pid) {
+            continue;
         }
-        return -1;
+
+        /* Open the target instance's message queue */
+        char target_mq_name[64];
+        snprintf(target_mq_name, sizeof(target_mq_name), "%s%d", MQ_NAME_PREFIX, instance_pid);
+
+        mqd_t target_mq = mq_open(target_mq_name, O_WRONLY | O_NONBLOCK);
+        if (target_mq == (mqd_t)-1) {
+            /* Instance may have just exited, skip silently */
+            continue;
+        }
+
+        /* Send the message */
+        if (mq_send(target_mq, (const char *)&msg, MQ_MSG_SIZE, 0) == 0) {
+            sent_count++;
+        }
+
+        mq_close(target_mq);
     }
-    return 1;
+    ipc_unlock();
+
+    return sent_count > 0 ? 0 : -1;
 }
 
 /* Signal handling */
@@ -463,31 +490,38 @@ static void monitor_scan_once(pid_t my_pid) {
         }
 
         pid_t current_pid = proc->pid;
-        int is_owner = (proc->owner_pid == my_pid);
         int is_detached = (proc->mode == MODE_DETACHED);
 
-        if (kill(proc->owner_pid, 0) == -1 && errno == ESRCH) {
-            printf("\n[MONITOR] Owner %d no longer exists, removing orphaned record for PID %d.\n",
-                   proc->owner_pid, current_pid);
-            proc->is_active = 0;
-            proc->status = STATUS_TERMINATED;
-            if (g_shared_data->process_count > 0) {
-                g_shared_data->process_count--;
+        int owner_alive = proc_is_alive(proc->owner_pid);
+
+        if (!owner_alive) {
+            if (!is_detached) {
+                printf("\n[MONITOR] Owner %d no longer exists, removing attached record for PID %d.\n",
+                       proc->owner_pid, current_pid);
+                proc->is_active = 0;
+                proc->status = STATUS_TERMINATED;
+                if (g_shared_data->process_count > 0) {
+                    g_shared_data->process_count--;
+                }
+                ipc_unlock();
+                mq_send_notification(IPC_CMD_PROCESS_TERMINATED, current_pid);
+                printf("Your choice: ");
+                fflush(stdout);
+                ipc_lock();
+                continue;
+            } else if (proc->owner_pid != my_pid) {
+                pid_t previous_owner = proc->owner_pid;
+                proc->owner_pid = my_pid;
+                printf("\n[MONITOR] Adopting detached process %d (previous owner %d).\n",
+                       current_pid, previous_owner);
+                printf("Your choice: ");
+                fflush(stdout);
             }
-            ipc_unlock();
-            mq_send_notification(IPC_CMD_PROCESS_TERMINATED, current_pid);
-            printf("Your choice: ");
-            fflush(stdout);
-            ipc_lock();
-            continue;
         }
 
+        /* Check if process is still valid (exists and matches command) */
         int process_valid = 0;
-        if (kill(current_pid, 0) == 0) {
-            process_valid = process_matches_command(current_pid, proc->command);
-        } else if (errno == ESRCH) {
-            process_valid = 0;
-        } else {
+        if (proc_is_alive(current_pid)) {
             process_valid = process_matches_command(current_pid, proc->command);
         }
 
@@ -506,6 +540,7 @@ static void monitor_scan_once(pid_t my_pid) {
             continue;
         }
 
+        int is_owner = (proc->owner_pid == my_pid);
         if (is_owner && !is_detached) {
             int status;
             pid_t result = waitpid(current_pid, &status, WNOHANG);
@@ -556,7 +591,6 @@ void* thread_monitor_func(void *arg) {
 /* Worker thread that uses timed receive on the MQ and prints inter-instance notifications. */
 void* thread_listener_func(void *arg) {
     (void)arg;
-    pid_t my_pid = getpid();
     IPCMessage msg;
 
     printf("[IPC LISTENER] Thread started. Listening for messages.\n");
@@ -567,7 +601,7 @@ void* thread_listener_func(void *arg) {
         clock_gettime(CLOCK_REALTIME, &timeout);
         timeout.tv_sec += 1;
 
-        ssize_t bytes = mq_timedreceive(g_msg_queue, (char *)&msg, sizeof(IPCMessage), NULL, &timeout);
+        ssize_t bytes = mq_timedreceive(g_my_msg_queue, (char *)&msg, MQ_MSG_SIZE, NULL, &timeout);
         if (bytes == -1) {
             if (errno == ETIMEDOUT) {
                 /* Timeout, check if we should continue */
@@ -583,10 +617,7 @@ void* thread_listener_func(void *arg) {
             continue;
         }
 
-        if (msg.sender_pid == my_pid) {
-            continue;
-        }
-
+        /* No need to check sender_pid anymore since we only receive from others */
         switch (msg.command) {
             case IPC_CMD_PROCESS_STARTED:
                 printf("\n[IPC] New process started: PID %d (by instance %d)\n",
@@ -654,7 +685,7 @@ static void trim_newline(char *str) {
     }
 }
 
-static void clear_stdin(void) {
+static void consume_stdin_line(void) {
     int c;
     while ((c = getchar()) != '\n' && c != EOF) {
     }
@@ -686,6 +717,10 @@ pid_t proc_start(const char *command, ProcessMode mode) {
     strncpy(cmd_copy, command, MAX_CMD_LEN - 1);
     cmd_copy[MAX_CMD_LEN - 1] = '\0';
 
+    char original_cmd[MAX_CMD_LEN];
+    strncpy(original_cmd, command, MAX_CMD_LEN - 1);
+    original_cmd[MAX_CMD_LEN - 1] = '\0';
+
     char *args[MAX_ARGS];
     int arg_count = proc_parse_command(cmd_copy, args, MAX_ARGS);
     if (arg_count == 0) {
@@ -693,37 +728,123 @@ pid_t proc_start(const char *command, ProcessMode mode) {
         return -1;
     }
 
-    pid_t pid = fork();
-    if (pid < 0) {
-        perror("fork");
-        return -1;
-    }
+    pid_t final_pid;
 
-    if (pid == 0) {
-        if (mode == MODE_DETACHED && setsid() == -1) {
-            perror("setsid");
+    if (mode == MODE_DETACHED) {
+        /* DETACHED MODE: Use double fork to create true daemon */
+        int pipefd[2];
+        if (pipe(pipefd) == -1) {
+            perror("pipe");
+            return -1;
         }
-        execvp(args[0], args);
-        perror("execvp");
-        _exit(127);
+
+        pid_t pid = fork();
+        if (pid < 0) {
+            perror("fork");
+            close(pipefd[0]);
+            close(pipefd[1]);
+            return -1;
+        }
+
+        if (pid == 0) {
+            /* First child */
+            close(pipefd[0]);  /* Close read end */
+
+            if (setsid() == -1) {
+                perror("setsid");
+                _exit(127);
+            }
+
+            /* Second fork to prevent acquiring controlling terminal */
+            pid_t pid2 = fork();
+            if (pid2 < 0) {
+                perror("second fork");
+                _exit(127);
+            }
+
+            if (pid2 > 0) {
+                /* First child: send grandchild PID to parent and exit */
+                write(pipefd[1], &pid2, sizeof(pid2));
+                close(pipefd[1]);
+                _exit(0);
+            }
+
+            /* Grandchild (true daemon) */
+            close(pipefd[1]);
+
+            /* Change working directory to root */
+            if (chdir("/") == -1) {
+                perror("chdir");
+            }
+
+            /* Reset file creation mask */
+            umask(0);
+
+            /* Redirect stdin/stdout/stderr to /dev/null */
+            int devnull = open("/dev/null", O_RDWR);
+            if (devnull != -1) {
+                dup2(devnull, STDIN_FILENO);
+                dup2(devnull, STDOUT_FILENO);
+                dup2(devnull, STDERR_FILENO);
+                if (devnull > STDERR_FILENO) {
+                    close(devnull);
+                }
+            }
+
+            /* Execute the command */
+            execvp(args[0], args);
+            perror("execvp");
+            _exit(127);
+        }
+
+        /* Parent process */
+        close(pipefd[1]);  /* Close write end */
+
+        /* Wait for first child to exit */
+        waitpid(pid, NULL, 0);
+
+        /* Read grandchild PID from pipe */
+        if (read(pipefd[0], &final_pid, sizeof(final_pid)) != sizeof(final_pid)) {
+            perror("read pipe");
+            close(pipefd[0]);
+            return -1;
+        }
+        close(pipefd[0]);
+
+    } else {
+        /* ATTACHED MODE: Simple fork */
+        pid_t pid = fork();
+        if (pid < 0) {
+            perror("fork");
+            return -1;
+        }
+
+        if (pid == 0) {
+            /* Child process */
+            execvp(args[0], args);
+            perror("execvp");
+            _exit(127);
+        }
+
+        final_pid = pid;
     }
 
-    char original_cmd[MAX_CMD_LEN];
-    strncpy(original_cmd, command, MAX_CMD_LEN - 1);
-    original_cmd[MAX_CMD_LEN - 1] = '\0';
-
+    /* Add process to shared memory */
     ipc_lock();
-    int slot = shm_add_process(pid, getpid(), original_cmd, mode);
+    int slot = shm_add_process(final_pid, getpid(), original_cmd, mode);
     ipc_unlock();
 
     if (slot < 0) {
-        printf("[ERROR] Process list is full! Killing child...\n");
-        kill(pid, SIGTERM);
+        printf("[ERROR] Process list is full!\n");
+        if (mode == MODE_ATTACHED) {
+            kill(final_pid, SIGTERM);
+        }
+        /* For detached, we can't easily kill it as it's already daemonized */
         return -1;
     }
 
-    mq_send_notification(IPC_CMD_PROCESS_STARTED, pid);
-    return pid;
+    mq_send_notification(IPC_CMD_PROCESS_STARTED, final_pid);
+    return final_pid;
 }
 
 void proc_start_interactive(void) {
@@ -744,10 +865,10 @@ void proc_start_interactive(void) {
     printf("Choose running mode (0: Attached, 1: Detached): ");
     if (scanf("%d", &mode_input) != 1) {
         printf("[ERROR] Invalid mode!\n");
-        clear_stdin();
+        consume_stdin_line();
         return;
     }
-    clear_stdin();
+    consume_stdin_line();
 
     if (mode_input != 0 && mode_input != 1) {
         printf("[ERROR] Mode must be 0 or 1!\n");
@@ -844,10 +965,10 @@ void proc_terminate_interactive(void) {
     printf("Process PID to terminate: ");
     if (scanf("%d", &target_pid) != 1) {
         printf("[ERROR] Invalid PID!\n");
-        clear_stdin();
+        consume_stdin_line();
         return;
     }
-    clear_stdin();
+    consume_stdin_line();
 
     if (target_pid <= 0) {
         printf("[ERROR] PID must be positive!\n");
@@ -968,7 +1089,7 @@ static void print_banner(void) {
     printf("║     ██║     ██║  ██║╚██████╔╝╚██████╗██╔╝ ██╗             ║\n");
     printf("║     ╚═╝     ╚═╝  ╚═╝ ╚═════╝  ╚═════╝╚═╝  ╚═╝             ║\n");
     printf("║                                                           ║\n");
-    printf("║     Advanced Process Management System v%s              ║\n", PROCX_VERSION);
+    printf("║     Advanced Process Management System v%s                ║\n", PROCX_VERSION);
     printf("║     Fatih Sultan Mehmet Vakif University                  ║\n");
     printf("║                                                           ║\n");
     printf("╚═══════════════════════════════════════════════════════════╝\n");
@@ -994,12 +1115,6 @@ static void print_goodbye(void) {
     printf("║  Detached processes will continue running.                ║\n");
     printf("╚═══════════════════════════════════════════════════════════╝\n");
     printf("\n");
-}
-
-static void clear_input_buffer(void) {
-    int c;
-    while ((c = getchar()) != '\n' && c != EOF) {
-    }
 }
 
 static int process_matches_command(pid_t pid, const char *expected_cmd) {
@@ -1034,20 +1149,22 @@ static int process_matches_command(pid_t pid, const char *expected_cmd) {
 }
 
 /**
- * Check if a process with the given PID is still alive.
- * Returns 1 if the process seems to exist, 0 if it clearly does not exist (ESRCH),
- * and 1 for other errors (treated as existing).
+ * Check if a process with the given PID is still alive and matches expected command.
+ * Returns 1 if the process seems to exist and matches, 0 otherwise.
  */
 static int proc_is_alive(pid_t pid) {
     if (pid <= 0) {
         return 0;
     }
-    if (kill(pid, 0) == 0) {
+    /* First check if process exists */
+    if (kill(pid, 0) == -1) {
+        if (errno == ESRCH) {
+            return 0;
+        }
+        /* Permission denied or other error - assume exists for safety */
         return 1;
     }
-    if (errno == ESRCH) {
-        return 0;
-    }
+    /* Process exists */
     return 1;
 }
 
@@ -1056,6 +1173,7 @@ static void cleanup_stale_processes_on_startup(void) {
         return;
     }
 
+    pid_t my_pid = getpid();
     ipc_lock();
     for (int i = 0; i < MAX_PROCESSES; i++) {
         ProcessInfo *proc = &g_shared_data->processes[i];
@@ -1063,18 +1181,27 @@ static void cleanup_stale_processes_on_startup(void) {
             continue;
         }
 
-        if (kill(proc->owner_pid, 0) == -1 && errno == ESRCH) {
-            printf("[STARTUP CLEANUP] Removing orphaned process record: PID %d (owner %d no longer exists)\n",
-                   proc->pid, proc->owner_pid);
-            proc->is_active = 0;
-            proc->status = STATUS_TERMINATED;
-            if (g_shared_data->process_count > 0) {
-                g_shared_data->process_count--;
+        int owner_alive = proc_is_alive(proc->owner_pid);
+        int is_detached = (proc->mode == MODE_DETACHED);
+
+        if (!owner_alive) {
+            if (!is_detached) {
+                printf("[STARTUP CLEANUP] Removing attached record: PID %d (owner %d no longer exists)\n",
+                       proc->pid, proc->owner_pid);
+                proc->is_active = 0;
+                proc->status = STATUS_TERMINATED;
+                if (g_shared_data->process_count > 0) {
+                    g_shared_data->process_count--;
+                }
+                continue;
+            } else if (proc->owner_pid != my_pid) {
+                printf("[STARTUP CLEANUP] Adopting detached process record: PID %d (previous owner %d)\n",
+                       proc->pid, proc->owner_pid);
+                proc->owner_pid = my_pid;
             }
-            continue;
         }
 
-        if (kill(proc->pid, 0) == -1 && errno == ESRCH) {
+        if (!proc_is_alive(proc->pid)) {
             printf("[STARTUP CLEANUP] Removing dead process record: PID %d\n", proc->pid);
             proc->is_active = 0;
             proc->status = STATUS_TERMINATED;
@@ -1150,10 +1277,10 @@ static void main_menu_loop(void) {
         printf("Your choice: ");
         if (scanf("%d", &choice) != 1) {
             printf("[ERROR] Invalid input! Please enter a number.\n");
-            clear_input_buffer();
+            consume_stdin_line();
             continue;
         }
-        clear_input_buffer();
+        consume_stdin_line();
         if (choice == 0) {
             printf("\n[INFO] Exit requested by user.\n");
             request_shutdown();
